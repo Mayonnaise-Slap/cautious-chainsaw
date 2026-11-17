@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tempfile import TemporaryDirectory
 from typing import Any
 
 DEFAULT_MODEL_ID = "unsloth/Llama-3.2-1B-Instruct"
@@ -35,7 +36,20 @@ def load_model(
         if torch.cuda.get_device_capability(torch.device(device)) < (8, 0):
             raise RuntimeError("BF16 model loading requires a GPU with native BF16 support.")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+    except Exception as exc:
+        if str(exc).strip() != "expected value at line 1 column 1":
+            raise
+        # Colab Drive caches can contain a corrupt snapshot file that force_download
+        # will still see as present. Isolate the tokenizer retry from that cache;
+        # model weights continue using the user's normal Hugging Face cache.
+        with TemporaryDirectory(prefix="chainsaw-tokenizer-") as tokenizer_cache:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_id,
+                cache_dir=tokenizer_cache,
+                force_download=True,
+            )
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.bfloat16 if dtype == "bf16" else torch.float16,

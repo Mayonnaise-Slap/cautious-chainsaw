@@ -1,6 +1,7 @@
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -68,6 +69,69 @@ def test_loader_routes_fp16_dtype(monkeypatch):
     actual_model, actual_tokenizer = load_hf_model(device="cpu", dtype="fp16")
     assert actual_model is not None and actual_tokenizer is tokenizer
     assert torch_values == ["fp16"]
+
+
+def test_loader_refetches_only_tokenizer_after_json_parse_error(monkeypatch):
+    calls = []
+    temporary_caches = []
+    fake_torch = types.SimpleNamespace(
+        bfloat16="bf16", float16="fp16", cuda=types.SimpleNamespace(is_available=lambda: False)
+    )
+    tokenizer = object()
+    model = types.SimpleNamespace(to=lambda device: None, eval=lambda: None)
+
+    def load_tokenizer(model_id, **kwargs):
+        calls.append((model_id, kwargs))
+        if len(calls) == 1:
+            raise Exception("expected value at line 1 column 1")
+        temporary_caches.append(Path(kwargs["cache_dir"]))
+        assert temporary_caches[-1].is_dir()
+        assert kwargs["force_download"] is True
+        return tokenizer
+
+    transformers = types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=load_tokenizer),
+        AutoModelForCausalLM=types.SimpleNamespace(
+            from_pretrained=lambda model_id, torch_dtype: model
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    actual_model, actual_tokenizer = load_hf_model(device="cpu", dtype="fp16")
+
+    assert actual_model is model
+    assert actual_tokenizer is tokenizer
+    assert calls[0] == (DEFAULT_MODEL_ID, {})
+    assert calls[1][0] == DEFAULT_MODEL_ID
+    assert set(calls[1][1]) == {"cache_dir", "force_download"}
+    assert calls[1][1]["force_download"] is True
+    assert temporary_caches[0].parent.exists()
+    assert not temporary_caches[0].exists()
+
+
+def test_loader_does_not_retry_other_tokenizer_errors(monkeypatch):
+    parse_error = OSError("connection refused")
+    calls = []
+    fake_torch = types.SimpleNamespace(
+        bfloat16="bf16", float16="fp16", cuda=types.SimpleNamespace(is_available=lambda: False)
+    )
+
+    def load_tokenizer(model_id, **kwargs):
+        calls.append(kwargs)
+        raise parse_error
+
+    transformers = types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=load_tokenizer),
+        AutoModelForCausalLM=types.SimpleNamespace(from_pretrained=lambda *args, **kwargs: None),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    with pytest.raises(OSError) as raised:
+        load_hf_model(device="cpu", dtype="fp16")
+    assert raised.value is parse_error
+    assert calls == [{}]
 
 
 @pytest.mark.gpu
