@@ -1,63 +1,44 @@
 import torch
+import triton
 import triton as tr
 import triton.language as tl
 
 
-@tr.jit
+@triton.jit
 def pack_int4_kernel(
-    Q,
-    P,
-    K: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    pid = tl.program_id(1)
-
-    pairs = pid * BLOCK + tl.arange(0, BLOCK)
-
-    idx = row * K + 2 * pairs
-
-    q0 = tl.load(Q + idx, pairs < K // 2, other=0)
-    q1 = tl.load(Q + idx + 1, pairs < K // 2, other=0)
-
-    lo = q0.to(tl.int32) & 0x0F
-    hi = q1.to(tl.int32) & 0x0F
-
-    packed = lo | (hi << 4)
-
-    out_idx = row * (K // 2) + pairs
-
-    tl.store(
-        P + out_idx,
-        packed.to(tl.uint8),
-        pairs < K // 2
-    )
-
-
-def pack_int4(Q, block_size=1024):
-    assert Q.ndim == 2
-    assert Q.dtype == torch.int8
-    assert Q.is_contiguous()
-
-    N, K = Q.shape
-    assert K % 2 == 0
-
-    P = torch.empty(
-        (N, K // 2),
-        device=Q.device,
-        dtype=torch.uint8
-    )
-
-    grid = (
-        N,
-        tr.cdiv(K // 2, block_size)
-    )
-
-    pack_int4_kernel[grid](
         Q,
         P,
-        K,
-        block_size
-    )
+        K_PAD: tl.constexpr,
+        BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block_id = tl.program_id(1)
+    pairs = block_id * BLOCK + tl.arange(0, BLOCK)
 
-    return P
+    mask = pairs < K_PAD // 2
+    idx = row * K_PAD + 2 * pairs
+
+    q0 = tl.load(Q + idx, mask, other=0).to(tl.int32)
+    q1 = tl.load(Q + idx + 1, mask, other=0).to(tl.int32)
+
+    packed = (q0 & 0x0F) | ((q1 & 0x0F) << 4)
+    out_idx = row * (K_PAD // 2) + pairs
+
+    tl.store(P + out_idx, packed.to(tl.uint8), mask)
+
+
+def pack_int4(q: torch.Tensor, block_size: int = 1024):
+    if q.ndim != 2 or q.dtype != torch.int8 or not q.is_contiguous():
+        raise ValueError("q must be a contiguous 2D int8 tensor")
+
+    n, k_pad = q.shape
+    if k_pad % 2:
+        raise ValueError("the padded K dimension must be even")
+
+    packed = torch.empty(
+        (n, k_pad // 2), device=q.device, dtype=torch.uint8
+    )
+    grid = (n, triton.cdiv(k_pad // 2, block_size))
+
+    pack_int4_kernel[grid](q, packed, k_pad, block_size)
+    return packed

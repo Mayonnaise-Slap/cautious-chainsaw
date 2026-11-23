@@ -4,31 +4,30 @@ import triton as tr
 import triton.language as tl
 
 
-def quantize_int4(W, group_size=128):
-    N, K = W.shape
+def quantize_int4(weights: torch.Tensor, group_size: int = 128):
+    if weights.ndim != 2:
+        raise ValueError("weights must have shape [N, K]")
+    if group_size <= 0:
+        raise ValueError("group_size must be positive")
 
-    K_PAD = tr.cdiv(K, group_size) * group_size
+    n, k = weights.shape
+    k_pad = triton.cdiv(k, group_size) * group_size
 
-    W_pad = torch.nn.functional.pad(
-        W.float(),
-        (0, K_PAD - K)
+    padded = torch.nn.functional.pad(
+        weights.float(), (0, k_pad - k)
+    )
+    grouped = padded.reshape(n, k_pad // group_size, group_size)
+
+    scales = (grouped.abs().amax(dim=-1) / 7.0).clamp(min=1e-8)
+    q = (
+        torch.round(grouped / scales.unsqueeze(-1))
+        .clamp(-8, 7)
+        .to(torch.int8)
+        .reshape(n, k_pad)
+        .contiguous()
     )
 
-    grouped = W_pad.reshape(
-        N, K_PAD // group_size, group_size
-    )
-
-    scales = (
-            grouped.abs().amax(dim=-1) / 7.0
-    ).clamp(min=1e-8)
-
-    Q = torch.round(
-        grouped / scales.unsqueeze(-1)
-    ).clamp(-8, 7).to(torch.int8)
-
-    Q = Q.reshape(N, K_PAD).contiguous()
-
-    return Q, scales.to(torch.float16).contiguous(), K, K_PAD
+    return q, scales.to(torch.float16).contiguous(), k, k_pad
 
 
 @triton.jit
