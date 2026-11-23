@@ -1,13 +1,15 @@
+import triton
+import triton.language as tr
+import torch
+
 @tr.jit
 def int4_matmul_kernel(
-    X,
-    P,
-    S,
-    Y,
+    X, P, S, Y,
 
     M: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
+    K_PAD: tl.constexpr,
 
     GROUP_SIZE: tl.constexpr,
 
@@ -27,41 +29,52 @@ def int4_matmul_kernel(
         dtype=tl.float32
     )
 
-    num_groups = K // GROUP_SIZE
+    num_groups = K_PAD // GROUP_SIZE
 
-    for k_start in range(tl.cdiv(K, BLOCK_K)):
+    for k_start in range(tl.cdiv(K_PAD, BLOCK_K)):
 
         k = k_start * BLOCK_K + offs_k
 
+        # Load activations.
+        # Padded positions are zero.
         x = tl.load(
             X + offs_m[:, None] * K + k[None, :],
             (offs_m[:, None] < M) &
             (k[None, :] < K),
             other=0
         )
+
+        # Load packed weights.
         packed_idx = (
-            offs_n[:, None] * (K // 2)
-            + (k[None, :] // 2)
+            offs_n[:, None] * (K_PAD // 2)
+            + k[None, :] // 2
+        )
+
+        w_mask = (
+            (offs_n[:, None] < N) &
+            (k[None, :] < K_PAD)
         )
 
         packed = tl.load(
             P + packed_idx,
-            (offs_n[:, None] < N) &
-            (k[None, :] < K),
+            w_mask,
             other=0
         ).to(tl.int32)
 
+        # Unpack INT4.
         low = packed & 0x0F
         high = (packed >> 4) & 0x0F
 
         q = tl.where(
-            (k[None, :] % 2) == 0,
+            k[None, :] % 2 == 0,
             low,
             high
         )
 
+        # Two's complement conversion.
         q = tl.where(q >= 8, q - 16, q)
 
+        # Load scales.
         group_idx = k // GROUP_SIZE
 
         scale_idx = (
@@ -71,21 +84,22 @@ def int4_matmul_kernel(
 
         scale = tl.load(
             S + scale_idx,
-            (offs_n[:, None] < N) &
-            (k[None, :] < K),
+            w_mask,
             other=0
         )
 
+        # Dequantize.
         w = q.to(tl.float32) * scale.to(tl.float32)
 
+        # T4: use FP16 Tensor Core operands.
         acc += tl.dot(
-            x,
-            tl.trans(w.to(tl.bfloat16))
+            x.to(tl.float16),
+            tl.trans(w.to(tl.float16))
         )
 
     tl.store(
         Y + offs_m[:, None] * N + offs_n[None, :],
-        acc.to(tl.bfloat16),
+        acc.to(Y.dtype.element_ty),
         (offs_m[:, None] < M) &
         (offs_n[None, :] < N)
     )
@@ -95,21 +109,21 @@ def int4_matmul(
     X,
     P,
     S,
+    K,
+    K_PAD,
     group_size=128,
     block_m=32,
     block_n=64,
     block_k=64,
 ):
-    assert X.dtype == torch.bfloat16
-    assert P.dtype == torch.uint8
-
-    M, K = X.shape
+    M, K_actual = X.shape
     N = P.shape[0]
 
-    assert K % 2 == 0
-    assert K % group_size == 0
-    assert P.shape == (N, K // 2)
-    assert S.shape == (N, K // group_size)
+    assert K_actual == K
+    assert K_PAD % group_size == 0
+    assert K_PAD % 2 == 0
+    assert P.shape == (N, K_PAD // 2)
+    assert S.shape == (N, K_PAD // group_size)
 
     assert X.is_contiguous()
     assert P.is_contiguous()
@@ -118,7 +132,7 @@ def int4_matmul(
     Y = torch.empty(
         (M, N),
         device=X.device,
-        dtype=torch.bfloat16
+        dtype=X.dtype
     )
 
     grid = (
@@ -128,7 +142,7 @@ def int4_matmul(
 
     int4_matmul_kernel[grid](
         X, P, S, Y,
-        M, N, K,
+        M, N, K, K_PAD,
         group_size,
         block_m, block_n, block_k,
         num_warps=4
