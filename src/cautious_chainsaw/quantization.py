@@ -3,97 +3,117 @@ import triton
 import triton as tr
 import triton.language as tl
 
+from matmul import DEFAULT_GROUP_SIZE
 
-def quantize_int4(weights: torch.Tensor, group_size: int = 128):
+
+@triton.jit
+def quantize_int4_kernel(
+    W,
+    Q,
+    S,
+    K: tl.constexpr,
+    K_PAD: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+
+    cols = group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+
+    weights = tl.load(
+        W + row * K + cols,
+        mask=cols < K,
+        other=0.0,
+    ).to(tl.float32)
+
+    max_abs = tl.max(tl.abs(weights), axis=0)
+
+    scale = tl.where(
+        max_abs > 0.0,
+        max_abs / 7.0,
+        1.0,
+    )
+
+    normalized = weights / scale
+
+    rounded = tl.where(
+        normalized >= 0.0,
+        tl.floor(normalized + 0.5),
+        tl.ceil(normalized - 0.5),
+    )
+
+    quantized = tl.minimum(
+        tl.maximum(rounded, -8.0),
+        7.0,
+    ).to(tl.int8)
+
+    tl.store(
+        Q + row * K_PAD + cols,
+        quantized,
+    )
+
+    tl.store(
+        S + row * (K_PAD // GROUP_SIZE) + group,
+        scale.to(tl.float16),
+    )
+
+
+def quantize_int4(
+    weights: torch.Tensor,
+    group_size: int = DEFAULT_GROUP_SIZE,
+):
+    """
+    Quantize a 2D weight matrix [N, K] into signed INT4 values.
+
+    Returns:
+        q:      [N, K_PAD], int8 temporary quantized values
+        scales: [N, K_PAD // group_size], float16
+        k:      original input dimension
+        k_pad:  padded input dimension
+    """
+
     if weights.ndim != 2:
         raise ValueError("weights must have shape [N, K]")
-    if group_size <= 0:
-        raise ValueError("group_size must be positive")
+
+    if weights.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("weights must be FP16 or BF16")
+
+    if not weights.is_cuda:
+        raise ValueError("weights must be on CUDA")
+
+    if group_size <= 0 or (group_size & (group_size - 1)) != 0:
+        raise ValueError("group_size must be a positive power of two")
+
+    weights = weights.contiguous()
 
     n, k = weights.shape
     k_pad = triton.cdiv(k, group_size) * group_size
 
-    padded = torch.nn.functional.pad(
-        weights.float(), (0, k_pad - k)
-    )
-    grouped = padded.reshape(n, k_pad // group_size, group_size)
-
-    scales = (grouped.abs().amax(dim=-1) / 7.0).clamp(min=1e-8)
-    q = (
-        torch.round(grouped / scales.unsqueeze(-1))
-        .clamp(-8, 7)
-        .to(torch.int8)
-        .reshape(n, k_pad)
-        .contiguous()
+    q = torch.empty(
+        (n, k_pad),
+        device=weights.device,
+        dtype=torch.int8,
     )
 
-    return q, scales.to(torch.float16).contiguous(), k, k_pad
-
-
-@triton.jit
-def dequant_int4_kernel(
-        P, S, W,
-        N: tl.constexpr,
-        K: tl.constexpr,
-        K_PAD: tl.constexpr,
-        GROUP_SIZE: tl.constexpr,
-        BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    pid = tl.program_id(1)
-
-    k = pid * BLOCK + tl.arange(0, BLOCK)
-
-    mask = k < K_PAD
-
-    packed = tl.load(
-        P + row * (K_PAD // 2) + k // 2,
-        mask,
-        other=0
-    ).to(tl.int32)
-
-    q = tl.where(
-        k % 2 == 0,
-        packed & 0x0F,
-        (packed >> 4) & 0x0F
-    )
-
-    q = tl.where(q >= 8, q - 16, q)
-
-    group = k // GROUP_SIZE
-
-    scale = tl.load(
-        S + row * (K_PAD // GROUP_SIZE) + group,
-        mask,
-        other=0
-    )
-
-    w = q.to(tl.float32) * scale.to(tl.float32)
-
-    tl.store(
-        W + row * K_PAD + k,
-        w.to(tl.float16),
-        mask
-    )
-
-
-def dequant_int4(P, S, N, K, K_PAD, group_size=128):
-    W = torch.empty(
-        (N, K_PAD),
-        device=P.device,
-        dtype=torch.float16
+    scales = torch.empty(
+        (n, k_pad // group_size),
+        device=weights.device,
+        dtype=torch.float16,
     )
 
     grid = (
-        N,
-        triton.cdiv(K_PAD, 512)
+        n,
+        k_pad // group_size,
     )
 
-    dequant_int4_kernel[grid](
-        P, S, W,
-        N, K, K_PAD,
+    quantize_int4_kernel[grid](
+        weights,
+        q,
+        scales,
+        k,
+        k_pad,
         group_size,
-        512
+        num_warps=4,
     )
 
-    return W[:, :K].contiguous()
+    return q, scales, k, k_pad
